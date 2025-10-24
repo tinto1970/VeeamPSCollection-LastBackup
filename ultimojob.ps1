@@ -19,7 +19,7 @@ New-Item -ItemType Directory -Path (Split-Path $csvPath) -Force | Out-Null
 Add-PSSnapin VeeamPSSnapIn -ErrorAction SilentlyContinue
 
 # Variabili
-$jobs = Get-VBRComputerBackupJob | Where-Object { $_.JobType -eq "Backup" }
+$jobs = Get-VBRJob | Where-Object { $_.JobType -eq "Backup" }
 $alertJobs = @()
 $allJobInfo = @()
 $recentBackups = $false  # Per controllo globale
