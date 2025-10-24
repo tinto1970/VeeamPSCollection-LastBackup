@@ -8,7 +8,7 @@ $txtPath  = "C:\Temp\Veeam_Alert_Report.txt"
 
 # === Email (opzionale) ===
 $enableEmail = $true
-$emailSubject = "🚨 Nessun backup riuscito nelle ultime $thresholdHours/$thresholdHoursLogs ore"
+$emailSubject = "🚨 Alert backup: uno o più tipi di job non hanno avuto esecuzione entro soglia"
 $emailTo = "admin@tuodominio.com"
 $emailFrom = "backup-alert@tuodominio.com"
 $smtpServer = "smtp.tuodominio.com"
@@ -20,17 +20,20 @@ $emailPassword = "smtp-password"
 New-Item -ItemType Directory -Path (Split-Path $csvPath) -Force | Out-Null
 Add-PSSnapin VeeamPSSnapIn -ErrorAction SilentlyContinue
 
+# === Inizializza flag ===
+$recentBackupNormal = $false
+$recentBackupLogs   = $false
+
 # === RACCOLTA JOB NORMALI ===
 $jobs = Get-VBRJob | Where-Object { $_.JobType -eq "Backup" }
 $allSessions = Get-VBRBackupSession
 $allJobInfo = @()
 $alertJobs = @()
-$recentBackups = $false
 
 foreach ($job in $jobs) {
     $lastSession = $allSessions |
         Where-Object { $_.JobName -eq $job.Name -and $_.Result -ne $null } |
-        Sort-Object CreationTime -Descending |
+        Sort-Object EndTime -Descending |
         Select-Object -First 1
 
     if ($lastSession) {
@@ -48,16 +51,14 @@ foreach ($job in $jobs) {
             HoursAgo    = $roundedHours
         }
 
-        if ($result -eq "Success" -and $hoursAgo -gt $thresholdHours) {
+        if ($result -eq "Success" -and $hoursAgo -le $thresholdHours) {
+            $recentBackupNormal = $true
+        } elseif ($result -eq "Success" -and $hoursAgo -gt $thresholdHours) {
             $alertJobs += [PSCustomObject]@{
                 JobName     = $job.Name
                 LastSuccess = $lastRun
                 HoursAgo    = $roundedHours
             }
-        }
-
-        if ($result -eq "Success" -and $hoursAgo -le $thresholdHours) {
-            $recentBackups = $true
         }
     } else {
         Write-Host "Job: $($job.Name) | Nessuna sessione trovata." -ForegroundColor Yellow
@@ -84,29 +85,35 @@ $sqlLogAlertList = @()
 if ($sqlLogSessions.Count -gt 0) {
     $groupedByVm = $sqlLogSessions |
         Where-Object { $_.Result -eq "Success" -and $_.EndTime -gt [datetime]"2000-01-01" } |
-        Sort-Object CreationTime -Descending |
+        Sort-Object EndTime -Descending |
         Group-Object {$_.Name}
 
     foreach ($group in $groupedByVm) {
-        $lastLogSession = $group.Group | Sort-Object CreationTime -Descending | Select-Object -First 1
+        $lastLogSession = $group.Group | Sort-Object EndTime -Descending | Select-Object -First 1
         $lastLogRun = $lastLogSession.EndTime
         $hoursAgo = (New-TimeSpan -Start $lastLogRun -End (Get-Date)).TotalHours
         $roundedHours = [math]::Round($hoursAgo, 2)
 
         Write-Host "SQL Log Backup: $($group.Name) | Ultima esecuzione: $lastLogRun | $roundedHours ore fa"
 
-        if ($hoursAgo -gt $thresholdHoursLogs) {
+        if ($hoursAgo -le $thresholdHoursLogs) {
+            $recentBackupLogs = $true
+        } else {
             $sqlLogAlertList += [PSCustomObject]@{
                 Target      = $group.Name
                 LastLogTime = $lastLogRun
                 HoursAgo    = $roundedHours
             }
-        } else {
-            $recentBackups = $true
         }
     }
 } else {
     Write-Host "⚠️ Nessun backup dei log SQL trovato." -ForegroundColor Yellow
+    # Qui potresti considerare che è un alert se vuoi
+    $sqlLogAlertList += [PSCustomObject]@{
+        Target      = "Tutti i log SQL"
+        LastLogTime = "Nessuna sessione"
+        HoursAgo    = "N/A"
+    }
 }
 
 # === ESPORTA FILE ===
@@ -118,7 +125,7 @@ $htmlHeader = "<h2>Job Veeam in Ritardo</h2><p>Generato: $(Get-Date)</p>"
 $htmlBody = ""
 
 if ($alertJobs.Count -gt 0) {
-    $htmlBody += "<h3>Backup Job</h3><table border='1' cellpadding='5' cellspacing='0'><tr><th>Job Name</th><th>Ultima Esecuzione</th><th>Ore Trascorse</th></tr>"
+    $htmlBody += "<h3>Backup Job Normali</h3><table border='1' cellpadding='5' cellspacing='0'><tr><th>Job Name</th><th>Ultima Esecuzione</th><th>Ore Trascorse</th></tr>"
     foreach ($j in $alertJobs) {
         $htmlBody += "<tr><td>$($j.JobName)</td><td>$($j.LastSuccess)</td><td>$($j.HoursAgo)</td></tr>"
     }
@@ -126,7 +133,7 @@ if ($alertJobs.Count -gt 0) {
 }
 
 if ($sqlLogAlertList.Count -gt 0) {
-    $htmlBody += "<br><h3>SQL Log Backup</h3><table border='1' cellpadding='5' cellspacing='0'><tr><th>Target</th><th>Ultimo Backup Log</th><th>Ore Trascorse</th></tr>"
+    $htmlBody += "<br><h3>Log SQL in Ritardo</h3><table border='1' cellpadding='5' cellspacing='0'><tr><th>Target</th><th>Ultimo Backup Log</th><th>Ore Trascorse</th></tr>"
     foreach ($log in $sqlLogAlertList) {
         $htmlBody += "<tr><td>$($log.Target)</td><td>$($log.LastLogTime)</td><td>$($log.HoursAgo)</td></tr>"
     }
@@ -137,13 +144,11 @@ if ($htmlBody -ne "") {
     "$htmlHeader$htmlBody" | Out-File -Encoding UTF8 -FilePath $htmlPath
     Write-Host "📄 HTML generato: $htmlPath" -ForegroundColor Green
 
-    # TXT parallelo
-    $txtReport = "=== JOB VEEAM IN RITARDO ===`nGenerato: $(Get-Date)`n"
+    $txtReport = "=== ALERT BACKUP ===`nGenerato: $(Get-Date)`n"
 
     foreach ($j in $alertJobs) {
         $txtReport += "`n➡️ Job: $($j.JobName)`n    Ultima esecuzione: $($j.LastSuccess)`n    Ore fa: $($j.HoursAgo)`n"
     }
-
     foreach ($log in $sqlLogAlertList) {
         $txtReport += "`n➡️ SQL Log: $($log.Target)`n    Ultimo log: $($log.LastLogTime)`n    Ore fa: $($log.HoursAgo)`n"
     }
@@ -152,20 +157,19 @@ if ($htmlBody -ne "") {
     Write-Host "📄 TXT generato: $txtPath" -ForegroundColor Green
 }
 
-# === STAMPA FINALE ===
-if ($recentBackups) {
-    Write-Host "`n✅ Almeno un backup eseguito con successo entro le soglie definite." -ForegroundColor Green
+# === STAMPA FINALE E INVIO EMAIL SE NECESSARIO ===
+if ($recentBackupNormal -and $recentBackupLogs) {
+    Write-Host "`n✅ OK: backup normali E log SQL eseguiti entro soglia." -ForegroundColor Green
 } else {
-    Write-Host "`n❌ Nessun backup riuscito entro le soglie ($thresholdHours h / $thresholdHoursLogs h)!" -ForegroundColor Red
+    Write-Host "`n❌ ALERT: uno o entrambi i tipi di job NON hanno avuto backup entro le soglie ($thresholdHours h normali / $thresholdHoursLogs h log SQL)!" -ForegroundColor Red
 
-    # === INVIO EMAIL SE ABILITATO ===
     if ($enableEmail -and (Test-Path $htmlPath)) {
         try {
             $securePass = ConvertTo-SecureString $emailPassword -AsPlainText -Force
             $cred = New-Object System.Management.Automation.PSCredential ($emailUser, $securePass)
 
             Send-MailMessage -From $emailFrom -To $emailTo -Subject $emailSubject `
-                -Body "Attenzione: non risultano backup recenti nei limiti stabiliti. In allegato il report." `
+                -Body "Attenzione: uno o più tipi di job non hanno avuto backup recenti. In allegato il report." `
                 -Attachments $htmlPath -SmtpServer $smtpServer -Port $smtpPort -UseSsl -Credential $cred
 
             Write-Host "📧 Email inviata a $emailTo con report allegato." -ForegroundColor Cyan
